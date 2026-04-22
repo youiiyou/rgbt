@@ -1,0 +1,17 @@
+checkpoints/
+weights/
+models/
+data/
+dataset/
+logs/
+runs/
+output/
+*.pth
+*.pt
+*.ckpt
+*.pkl
+*.h5
+__pycache__/
+*.pyc
+venv/
+.env
