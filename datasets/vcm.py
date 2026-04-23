@@ -63,8 +63,8 @@ class VCM(BaseDataset):
         self.test_id_container = set()
         self.val_id_container = set()
 
-        self.train_pid2label = []
-        self.test_pid2label = []
+        self.train_pid2label = {}
+        self.test_pid2label = {}
 
         self.num_frames = num_frames
 
@@ -75,7 +75,6 @@ class VCM(BaseDataset):
         self._build_train_single_frame()
         self._build_gallery_single_frame()
         self._build_query_single()
-        self._build_eval_single_frame_dict()
         self._build_train_multi_frame(self.num_frames)
         self._build_gallery_multi_frame(self.num_frames)
 
@@ -93,15 +92,11 @@ class VCM(BaseDataset):
             print("num_train_ids:", len(self.train_id_container))
             print("num_test_ids:", len(self.test_id_container))
 
-            print("train_multi:", len(self.train_multi))
-            print("gallery_rgb_multi:", len(self.gallery_rgb_multi))
-            print("gallery_ir_multi:", len(self.gallery_ir_multi))
-            print("gallery_mixed_multi:", len(self.gallery_mixed_multi))
-
-            print(self.train_multi[0])
-            print(len(self.train_multi[0][2]))
-            print(self.gallery_rgb_multi[0])
-            print(len(self.gallery_rgb_multi[0]['img_paths']))
+            print("raw tracklet frame count:", len(self.train_tracklets[0]['all_frame_paths']))
+            print("raw tracklet caption count:", len(self.train_tracklets[0]['captions']))
+            print("train_multi sample:", self.train_multi[0])
+            print("sampled 6-frame count:", len(self.train_multi[0][2]))
+ 
 
     def _check_before_run(self):
         required_dirs = [self.dataset_dir, self.train_dir, self.test_dir]
@@ -235,7 +230,7 @@ class VCM(BaseDataset):
             }
             self.gallery_ir_single.append(record)
 
-            self.gallery_mixed_single = self.gallery_rgb_single + self.gallery_ir_single
+        self.gallery_mixed_single = self.gallery_rgb_single + self.gallery_ir_single
 
     def _build_gallery_multi_frame(self, num_frames):
         self.gallery_rgb_multi = []
@@ -280,7 +275,7 @@ class VCM(BaseDataset):
 
     def _build_query_single(self):
         self.query_single = []
-        
+
         for item in self.query_texts:
             pid = item['pid']
             caption = item['caption']
@@ -411,6 +406,8 @@ class VCM(BaseDataset):
             rgb_path = op.join(pid_path, 'rgb')
             ir_path = op.join(pid_path, 'ir')
             
+            rgb_pid_captions = []
+
             if op.isdir(rgb_path):
                 rgb_pid_set.add(pid)
 
@@ -425,7 +422,10 @@ class VCM(BaseDataset):
                     cam_path = op.join(rgb_path, cam_name)
                     frame_paths = self._collect_frame_paths(cam_path)
                     if len(frame_paths) > 0:
-                        captions = self._read_caption(cam_path)
+                        captions = self._read_captions(cam_path)
+                        for cap in captions:
+                            if cap not in rgb_pid_captions:
+                                rgb_pid_captions.append(cap)
                         rgb_valid_tracklet_count += 1
 
                         if split_name == 'Train':
@@ -448,11 +448,14 @@ class VCM(BaseDataset):
                             }
                             self.gallery_rgb_tracklets.append(record)
                             self.test_id_container.add(pid_label)
-                            caption = self._read_caption(cam_path)
-                            query_record = {
-                                'pid': pid_label,
-                                'captions': captions
-                            }
+                            caption = self._read_captions(cam_path)
+                            captions = self._read_captions(cam_path)
+                            for caption in captions:
+                                query_record = {
+                                    'pid': pid_label,
+                                    'caption': caption
+                                }
+                                self.query_texts.append(query_record)
                             self.query_texts.append(query_record)
                 rgb_camera_count += len(rgb_camera_list)
 
@@ -470,16 +473,16 @@ class VCM(BaseDataset):
                     cam_path = op.join(ir_path, cam_name)
                     frame_paths = self._collect_frame_paths(cam_path)
                     if len(frame_paths) > 0:
-                        caption = self._read_caption(cam_path)
                         ir_valid_tracklet_count += 1
 
                         if split_name == 'Train':
+                            captions = list(rgb_pid_captions)
                             record = {
                                 'pid': pid_label,
                                 'modality': 'ir',
                                 'camid': cam_name,
                                 'all_frame_paths': frame_paths,
-                                'caption': caption
+                                'captions': captions
                             }
                             self.train_tracklets.append(record)
                             self.train_id_container.add(pid_label)
