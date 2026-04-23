@@ -68,6 +68,7 @@ def get_args():
     parser.add_argument("--test_batch_size", type=int, default=512)
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--test", dest='training', default=True, action='store_false')
+    parser.add_argument("--num_frames", type=int, default=1)
 
     args = parser.parse_args()
 

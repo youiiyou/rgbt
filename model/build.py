@@ -78,10 +78,25 @@ class IRRA(nn.Module):
         x = self.ln_post(x)
         return x
 
+    def _encode_image_tokens_single(self, image):
+        return self.base_model.encode_image(image)
     def encode_image(self, image):
-        x = self.base_model.encode_image(image)
-        return x[:, 0, :].float()
-        # return x.float() # for CLIP ResNet visual model
+        if image.dim() == 4:
+            x = self._encode_image_tokens_single(image)
+            return x[:, 0, :].float()
+
+        elif image.dim() == 5:
+            b, t, c, h, w = image.shape
+            image = image.reshape(b * t, c, h, w)
+
+            x = self._encode_image_tokens_single(image)   # [B*T, L, D]
+            x = x[:, 0, :].float()                        # [B*T, D]
+            x = x.reshape(b, t, -1)                       # [B, T, D]
+            x = x.mean(dim=1)                             # [B, D]
+            return x
+
+        else:
+            raise ValueError(f"Unexpected image shape: {image.shape}")
 
     def encode_text(self, text):
         x = self.base_model.encode_text(text)
@@ -92,10 +107,10 @@ class IRRA(nn.Module):
 
         images = batch['images']
         caption_ids = batch['caption_ids']
-        image_feats, text_feats = self.base_model(images, caption_ids)
-        i_feats = image_feats[:, 0, :].float()
+        
+        i_feats = self.encode_image(images)
         # i_feats = image_feats.float() # for CLIP ResNet visual model
-        t_feats = text_feats[torch.arange(text_feats.shape[0]), caption_ids.argmax(dim=-1)].float()
+        t_feats = self.encode_text(caption_ids)
 
         logit_scale = self.logit_scale
         ret.update({'temperature': 1 / logit_scale})
@@ -123,8 +138,11 @@ class IRRA(nn.Module):
             ret.update({'txt_acc': text_precision})
         
         if 'mlm' in self.current_task:
-            mlm_ids = batch['mlm_ids']
+            if images.dim() != 4:
+                raise NotImplementedError("MLM is not supported for multi-frame baseline. Please set MLM=False.")
 
+            image_feats = self._encode_image_tokens_single(images)
+            mlm_ids = batch['mlm_ids']
             mlm_feats = self.base_model.encode_text(mlm_ids)
 
             x = self.cross_former(mlm_feats, image_feats, image_feats)

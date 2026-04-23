@@ -56,6 +56,21 @@ def tokenize(caption: str, tokenizer, text_length=77, truncate=True) -> torch.Lo
     result[:len(tokens)] = torch.tensor(tokens)
     return result
 
+def _read_images(img_input):
+    if isinstance(img_input, str):
+        return read_image(img_input)
+
+    if isinstance(img_input, list):
+        return [read_image(p) for p in img_input]
+
+    raise TypeError(f"Unsupported img_input type: {type(img_input)}")
+
+def _apply_transform(img_input, transform):
+    if isinstance(img_input, list):
+        imgs = [transform(img) if transform is not None else img for img in img_input]
+        return torch.stack(imgs, dim=0)   # [T, C, H, W]
+
+    return transform(img_input) if transform is not None else img_input
 
 class ImageTextDataset(Dataset):
     def __init__(self,
@@ -74,9 +89,9 @@ class ImageTextDataset(Dataset):
 
     def __getitem__(self, index):
         pid, image_id, img_path, caption = self.dataset[index]
-        img = read_image(img_path)
-        if self.transform is not None:
-            img = self.transform(img)
+
+        img = _read_images(img_path)
+        img = _apply_transform(img, self.transform)
 
         tokens = tokenize(caption, tokenizer=self.tokenizer, text_length=self.text_length, truncate=self.truncate)
 
@@ -101,9 +116,10 @@ class ImageDataset(Dataset):
 
     def __getitem__(self, index):
         pid, img_path = self.image_pids[index], self.img_paths[index]
-        img = read_image(img_path)
-        if self.transform is not None:
-            img = self.transform(img)
+
+        img = _read_images(img_path)
+        img = _apply_transform(img, self.transform)
+
         return pid, img
 
 
@@ -148,9 +164,8 @@ class ImageTextMLMDataset(Dataset):
 
     def __getitem__(self, index):
         pid, image_id, img_path, caption = self.dataset[index]
-        img = read_image(img_path)
-        if self.transform is not None:
-            img = self.transform(img)
+        img = _read_images(img_path)
+        img = _apply_transform(img, self.transform)
         
         caption_tokens = tokenize(caption, tokenizer=self.tokenizer, text_length=self.text_length, truncate=self.truncate)
 
