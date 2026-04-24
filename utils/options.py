@@ -69,6 +69,8 @@ def get_args():
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--test", dest='training', default=True, action='store_false')
     parser.add_argument("--num_frames", type=int, default=1)
+    parser.add_argument("--train_caption_mode", choices=["single", "double"], default="double")
+    parser.add_argument("--ir_grayscale", default=False, action='store_true')
 
     args = parser.parse_args()
 

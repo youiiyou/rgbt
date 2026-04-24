@@ -76,7 +76,8 @@ def build_dataloader(args, tranforms=None):
     if args.dataset_name == 'VCM':
         dataset = __factory[args.dataset_name](
             root=args.root_dir,
-            num_frames=args.num_frames
+            num_frames=args.num_frames,
+            train_caption_mode=getattr(args, 'train_caption_mode', 'double')
         )
     else:
         dataset = __factory[args.dataset_name](root=args.root_dir)
@@ -92,11 +93,13 @@ def build_dataloader(args, tranforms=None):
         if args.MLM:
             train_set = ImageTextMLMDataset(dataset.train,
                                      train_transforms,
-                                     text_length=args.text_length)
+                                     text_length=args.text_length,
+                                     ir_grayscale=args.ir_grayscale)
         else:
             train_set = ImageTextDataset(dataset.train,
                                      train_transforms,
-                                     text_length=args.text_length)
+                                     text_length=args.text_length,
+                                     ir_grayscale=args.ir_grayscale)
 
         if args.sampler == 'identity':
             if args.distributed:
@@ -134,7 +137,8 @@ def build_dataloader(args, tranforms=None):
         # use test set as validate set
         ds = dataset.val if args.val_dataset == 'val' else dataset.test
         val_img_set = ImageDataset(ds['image_pids'], ds['img_paths'],
-                                   val_transforms)
+                                   val_transforms,
+                                   ir_grayscale=args.ir_grayscale)
         val_txt_set = TextDataset(ds['caption_pids'],
                                   ds['captions'],
                                   text_length=args.text_length)
@@ -160,7 +164,8 @@ def build_dataloader(args, tranforms=None):
 
         ds = dataset.test
         test_img_set = ImageDataset(ds['image_pids'], ds['img_paths'],
-                                    test_transforms)
+                                    test_transforms,
+                                    ir_grayscale=args.ir_grayscale)
         test_txt_set = TextDataset(ds['caption_pids'],
                                    ds['captions'],
                                    text_length=args.text_length)

@@ -65,6 +65,22 @@ def _read_images(img_input):
 
     raise TypeError(f"Unsupported img_input type: {type(img_input)}")
 
+def _is_ir_sample(img_input):
+    sample_path = img_input[0] if isinstance(img_input, list) else img_input
+    if not isinstance(sample_path, str):
+        return False
+    normalized_path = sample_path.replace("\\", "/").lower()
+    return "/ir/" in normalized_path
+
+def _maybe_apply_ir_grayscale(img_input, img, ir_grayscale):
+    if not ir_grayscale or not _is_ir_sample(img_input):
+        return img
+
+    if isinstance(img, list):
+        return [frame.convert('L').convert('RGB') for frame in img]
+
+    return img.convert('L').convert('RGB')
+
 def _apply_transform(img_input, transform):
     if isinstance(img_input, list):
         imgs = [transform(img) if transform is not None else img for img in img_input]
@@ -77,11 +93,13 @@ class ImageTextDataset(Dataset):
                  dataset,
                  transform=None,
                  text_length: int = 77,
-                 truncate: bool = True):
+                 truncate: bool = True,
+                 ir_grayscale: bool = False):
         self.dataset = dataset
         self.transform = transform
         self.text_length = text_length
         self.truncate = truncate
+        self.ir_grayscale = ir_grayscale
         self.tokenizer = SimpleTokenizer()
 
     def __len__(self):
@@ -91,6 +109,7 @@ class ImageTextDataset(Dataset):
         pid, image_id, img_path, caption = self.dataset[index]
 
         img = _read_images(img_path)
+        img = _maybe_apply_ir_grayscale(img_path, img, self.ir_grayscale)
         img = _apply_transform(img, self.transform)
 
         tokens = tokenize(caption, tokenizer=self.tokenizer, text_length=self.text_length, truncate=self.truncate)
@@ -106,10 +125,11 @@ class ImageTextDataset(Dataset):
 
 
 class ImageDataset(Dataset):
-    def __init__(self, image_pids, img_paths, transform=None):
+    def __init__(self, image_pids, img_paths, transform=None, ir_grayscale: bool = False):
         self.image_pids = image_pids
         self.img_paths = img_paths
         self.transform = transform
+        self.ir_grayscale = ir_grayscale
 
     def __len__(self):
         return len(self.image_pids)
@@ -118,6 +138,7 @@ class ImageDataset(Dataset):
         pid, img_path = self.image_pids[index], self.img_paths[index]
 
         img = _read_images(img_path)
+        img = _maybe_apply_ir_grayscale(img_path, img, self.ir_grayscale)
         img = _apply_transform(img, self.transform)
 
         return pid, img
@@ -151,11 +172,13 @@ class ImageTextMLMDataset(Dataset):
                  dataset,
                  transform=None,
                  text_length: int = 77,
-                 truncate: bool = True):
+                 truncate: bool = True,
+                 ir_grayscale: bool = False):
         self.dataset = dataset
         self.transform = transform
         self.text_length = text_length
         self.truncate = truncate
+        self.ir_grayscale = ir_grayscale
 
         self.tokenizer = SimpleTokenizer()
 
@@ -165,6 +188,7 @@ class ImageTextMLMDataset(Dataset):
     def __getitem__(self, index):
         pid, image_id, img_path, caption = self.dataset[index]
         img = _read_images(img_path)
+        img = _maybe_apply_ir_grayscale(img_path, img, self.ir_grayscale)
         img = _apply_transform(img, self.transform)
         
         caption_tokens = tokenize(caption, tokenizer=self.tokenizer, text_length=self.text_length, truncate=self.truncate)

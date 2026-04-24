@@ -80,19 +80,32 @@ class IRRA(nn.Module):
 
     def _encode_image_tokens_single(self, image):
         return self.base_model.encode_image(image)
-    def encode_image(self, image):
+
+    def _encode_image_tokens(self, image):
         if image.dim() == 4:
-            x = self._encode_image_tokens_single(image)
-            return x[:, 0, :].float()
+            return self._encode_image_tokens_single(image)
 
         elif image.dim() == 5:
             b, t, c, h, w = image.shape
             image = image.reshape(b * t, c, h, w)
 
             x = self._encode_image_tokens_single(image)   # [B*T, L, D]
-            x = x[:, 0, :].float()                        # [B*T, D]
-            x = x.reshape(b, t, -1)                       # [B, T, D]
-            x = x.mean(dim=1)                             # [B, D]
+            _, l, d = x.shape
+            x = x.reshape(b, t, l, d)                     # [B, T, L, D]
+            x = x.mean(dim=1)                             # [B, L, D]
+            return x
+
+        else:
+            raise ValueError(f"Unexpected image shape: {image.shape}")
+
+    def encode_image(self, image):
+        if image.dim() == 4:
+            x = self._encode_image_tokens(image)
+            return x[:, 0, :].float()
+
+        elif image.dim() == 5:
+            x = self._encode_image_tokens(image)
+            x = x[:, 0, :].float()                        # [B, D]
             return x
 
         else:
@@ -125,8 +138,9 @@ class IRRA(nn.Module):
             ret.update({'cmpm_loss':objectives.compute_cmpm(i_feats, t_feats, batch['pids'])})
         
         if 'id' in self.current_task:
-            image_logits = self.classifier(i_feats.half()).float()
-            text_logits = self.classifier(t_feats.half()).float()
+            classifier_dtype = self.classifier.weight.dtype
+            image_logits = self.classifier(i_feats.to(classifier_dtype)).float()
+            text_logits = self.classifier(t_feats.to(classifier_dtype)).float()
             ret.update({'id_loss':objectives.compute_id(image_logits, text_logits, batch['pids'])*self.args.id_loss_weight})
 
             image_pred = torch.argmax(image_logits, dim=1)
@@ -138,10 +152,7 @@ class IRRA(nn.Module):
             ret.update({'txt_acc': text_precision})
         
         if 'mlm' in self.current_task:
-            if images.dim() != 4:
-                raise NotImplementedError("MLM is not supported for multi-frame baseline. Please set MLM=False.")
-
-            image_feats = self._encode_image_tokens_single(images)
+            image_feats = self._encode_image_tokens(images)
             mlm_ids = batch['mlm_ids']
             mlm_feats = self.base_model.encode_text(mlm_ids)
 

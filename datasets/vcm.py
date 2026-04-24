@@ -32,9 +32,12 @@ class VCM(BaseDataset):
                 ...
     """
 
-    def __init__(self, root='', verbose=True, num_frames=1):
+    def __init__(self, root='', verbose=True, num_frames=1, train_caption_mode='double'):
         super().__init__()
         self._debug_print_done = False
+
+        if train_caption_mode not in ('single', 'double'):
+            raise ValueError(f"Invalid train_caption_mode: {train_caption_mode}")
 
         self.dataset_dir = op.join(root, self.dataset_dir)
         self.train_dir = op.join(self.dataset_dir, 'Train')
@@ -67,6 +70,7 @@ class VCM(BaseDataset):
         self.test_pid2label = {}
 
         self.num_frames = num_frames
+        self.train_caption_mode = train_caption_mode
 
         self._check_before_run()
 
@@ -85,17 +89,21 @@ class VCM(BaseDataset):
             self._build_eval_multi_frame_dict()
 
         if verbose:
+            caption_stats = self._compute_train_caption_stats()
             print("VCM loaded")
             print("train:", len(self.train))
             print("query_single:", len(self.query_single))
             print("gallery_mixed_single:", len(self.gallery_mixed_single))
             print("num_train_ids:", len(self.train_id_container))
             print("num_test_ids:", len(self.test_id_container))
-
-            print("raw tracklet frame count:", len(self.train_tracklets[0]['all_frame_paths']))
-            print("raw tracklet caption count:", len(self.train_tracklets[0]['captions']))
-            print("train_multi sample:", self.train_multi[0])
-            print("sampled 6-frame count:", len(self.train_multi[0][2]))
+            print("train_caption_mode:", self.train_caption_mode)
+            print("avg rgb captions per train tracklet:", f"{caption_stats['avg_rgb']:.4f}")
+            print("avg ir captions per train tracklet:", f"{caption_stats['avg_ir']:.4f}")
+            print("max rgb captions:", caption_stats['max_rgb'])
+            print("max ir captions:", caption_stats['max_ir'])
+            print("len(train_tracklets):", len(self.train_tracklets))
+            print("len(train_multi):", len(self.train_multi))
+            print("len(query_single):", len(self.query_single))
  
 
     def _check_before_run(self):
@@ -351,10 +359,23 @@ class VCM(BaseDataset):
         self.val_annos = self.gallery_mixed_multi
         self.val_id_container = set(self.test_id_container)
 
-    def _read_captions(self, cam_dir):
-        captions = []
+    def _read_caption_file(self, cam_dir, filename):
+        path = op.join(cam_dir, filename)
+        if not op.isfile(path):
+            return ''
 
-        for name in ['caption.txt', 'caption_aug.txt']:
+        with open(path, 'r', encoding='utf-8') as f:
+            text = f.read().strip()
+
+        return text
+
+    def _read_captions(self, cam_dir, include_aug=True, max_captions=2):
+        captions = []
+        caption_files = ['caption.txt']
+        if include_aug:
+            caption_files.append('caption_aug.txt')
+
+        for name in caption_files:
             path = op.join(cam_dir, name)
             if not op.isfile(path):
                 continue
@@ -367,7 +388,38 @@ class VCM(BaseDataset):
 
         # 去重，避免两个文件内容完全一样
         captions = list(dict.fromkeys(captions))
+        if max_captions is not None:
+            captions = captions[:max_captions]
         return captions
+
+    def _read_train_captions(self, cam_dir):
+        if self.train_caption_mode == 'single':
+            return self._read_captions(cam_dir, include_aug=False, max_captions=1)
+
+        return self._read_captions(cam_dir, include_aug=True, max_captions=2)
+
+    def _compute_train_caption_stats(self):
+        rgb_caption_counts = []
+        ir_caption_counts = []
+
+        for tracklet in self.train_tracklets:
+            captions = tracklet.get('captions', [])
+            count = len(captions)
+            modality = tracklet.get('modality')
+            if modality == 'rgb':
+                rgb_caption_counts.append(count)
+            elif modality == 'ir':
+                ir_caption_counts.append(count)
+
+        rgb_avg = (sum(rgb_caption_counts) / len(rgb_caption_counts)) if rgb_caption_counts else 0.0
+        ir_avg = (sum(ir_caption_counts) / len(ir_caption_counts)) if ir_caption_counts else 0.0
+
+        return {
+            'avg_rgb': rgb_avg,
+            'avg_ir': ir_avg,
+            'max_rgb': max(rgb_caption_counts) if rgb_caption_counts else 0,
+            'max_ir': max(ir_caption_counts) if ir_caption_counts else 0,
+        }
     
     def _process_split(self, split_name):
         if split_name == 'Train':
@@ -406,7 +458,8 @@ class VCM(BaseDataset):
             rgb_path = op.join(pid_path, 'rgb')
             ir_path = op.join(pid_path, 'ir')
             
-            rgb_pid_captions = []
+            canonical_rgb_captions = []
+            canonical_rgb_selected = False
 
             if op.isdir(rgb_path):
                 rgb_pid_set.add(pid)
@@ -422,10 +475,14 @@ class VCM(BaseDataset):
                     cam_path = op.join(rgb_path, cam_name)
                     frame_paths = self._collect_frame_paths(cam_path)
                     if len(frame_paths) > 0:
-                        captions = self._read_captions(cam_path)
-                        for cap in captions:
-                            if cap not in rgb_pid_captions:
-                                rgb_pid_captions.append(cap)
+                        if split_name == 'Train':
+                            captions = self._read_train_captions(cam_path)
+                        else:
+                            captions = []
+
+                        if split_name == 'Train' and (not canonical_rgb_selected) and len(captions) > 0:
+                            canonical_rgb_captions = list(captions)
+                            canonical_rgb_selected = True
                         rgb_valid_tracklet_count += 1
 
                         if split_name == 'Train':
@@ -448,15 +505,14 @@ class VCM(BaseDataset):
                             }
                             self.gallery_rgb_tracklets.append(record)
                             self.test_id_container.add(pid_label)
-                            caption = self._read_captions(cam_path)
-                            captions = self._read_captions(cam_path)
-                            for caption in captions:
+
+                            query_captions = self._read_captions(cam_path, include_aug=False, max_captions=1)
+                            if len(query_captions) > 0:
                                 query_record = {
                                     'pid': pid_label,
-                                    'caption': caption
+                                    'caption': query_captions[0]
                                 }
                                 self.query_texts.append(query_record)
-                            self.query_texts.append(query_record)
                 rgb_camera_count += len(rgb_camera_list)
 
             if op.isdir(ir_path):
@@ -476,7 +532,7 @@ class VCM(BaseDataset):
                         ir_valid_tracklet_count += 1
 
                         if split_name == 'Train':
-                            captions = list(rgb_pid_captions)
+                            captions = list(canonical_rgb_captions)
                             record = {
                                 'pid': pid_label,
                                 'modality': 'ir',
