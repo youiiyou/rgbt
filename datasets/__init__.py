@@ -1,1 +1,3 @@
-from .build import build_dataloader
+from .build import build_dataloader, build_dataset
+
+__all__ = ["build_dataloader", "build_dataset"]

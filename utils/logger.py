@@ -1,32 +1,40 @@
+from __future__ import annotations
+
 import logging
-import os
 import sys
-import os.path as op
+from pathlib import Path
 
 
 def setup_logger(name, save_dir, if_train, distributed_rank=0):
     logger = logging.getLogger(name)
     logger.setLevel(logging.DEBUG)
+    logger.propagate = False
 
-    # don't log results for the non-master process
+    for handler in list(logger.handlers):
+        handler.close()
+        logger.removeHandler(handler)
+
     if distributed_rank > 0:
         return logger
 
-    ch = logging.StreamHandler(stream=sys.stdout)
-    ch.setLevel(logging.DEBUG)
-    formatter = logging.Formatter("%(asctime)s %(name)s %(levelname)s: %(message)s")
-    ch.setFormatter(formatter)
-    logger.addHandler(ch)
+    formatter = logging.Formatter(
+        "%(asctime)s %(name)s %(levelname)s: %(message)s"
+    )
+    console_handler = logging.StreamHandler(stream=sys.stdout)
+    console_handler.setLevel(logging.DEBUG)
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
 
-    if not op.exists(save_dir):
-        print(f"{save_dir} is not exists, create given directory")
-        os.makedirs(save_dir)
-    if if_train:
-        fh = logging.FileHandler(os.path.join(save_dir, "train_log.txt"), mode='w')
-    else:
-        fh = logging.FileHandler(os.path.join(save_dir, "test_log.txt"), mode='a')
-    fh.setLevel(logging.DEBUG)
-    fh.setFormatter(formatter)
-    logger.addHandler(fh)
-
+    output_dir = Path(save_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    log_name = "train_log.txt" if if_train else "test_log.txt"
+    mode = "w" if if_train else "a"
+    file_handler = logging.FileHandler(
+        output_dir / log_name,
+        mode=mode,
+        encoding="utf-8",
+    )
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
     return logger

@@ -1,155 +1,165 @@
-from typing import List
-from torch.utils.data import Dataset
-import os.path as osp
+from __future__ import annotations
+
 import logging
+import random
+
+import numpy as np
 import torch
+from prettytable import PrettyTable
+from torch.utils.data import Dataset
+
 from utils.iotools import read_image
 from utils.simple_tokenizer import SimpleTokenizer
-from prettytable import PrettyTable
-import random
-import regex as re
-import copy
 
 
-class BaseDataset(object):
-    """
-    Base class of text to image reid dataset
-    """
+class BaseDataset:
     logger = logging.getLogger("IRRA.dataset")
 
-    def show_dataset_info(self):
-        num_train_pids, num_train_imgs, num_train_captions = len(
-            self.train_id_container), len(self.train_annos), len(self.train)
-        num_test_pids, num_test_imgs, num_test_captions = len(
-            self.test_id_container), len(self.test_annos), len(
-                self.test['captions'])
-        num_val_pids, num_val_imgs, num_val_captions = len(
-            self.val_id_container), len(self.val_annos), len(
-                self.val['captions'])
-
-        # TODO use prettytable print comand line table
-
-        self.logger.info(f"{self.__class__.__name__} Dataset statistics:")
-        table = PrettyTable(['subset', 'ids', 'images', 'captions'])
+    def show_dataset_info(self) -> None:
+        table = PrettyTable(["subset", "ids", "tracklets", "captions"])
         table.add_row(
-            ['train', num_train_pids, num_train_imgs, num_train_captions])
+            [
+                "train",
+                len(self.train_id_container),
+                len(self.train_annos),
+                len(self.train),
+            ]
+        )
         table.add_row(
-            ['test', num_test_pids, num_test_imgs, num_test_captions])
-        table.add_row(['val', num_val_pids, num_val_imgs, num_val_captions])
-        self.logger.info('\n' + str(table))
+            [
+                "test",
+                len(self.test_id_container),
+                len(self.test_annos),
+                len(self.test["captions"]),
+            ]
+        )
+        self.logger.info("\n%s", table)
 
 
-def tokenize(caption: str, tokenizer, text_length=77, truncate=True) -> torch.LongTensor:
-    sot_token = tokenizer.encoder["<|startoftext|>"]
-    eot_token = tokenizer.encoder["<|endoftext|>"]
-    tokens = [sot_token] + tokenizer.encode(caption) + [eot_token]
-
+def tokenize(
+    caption: str,
+    tokenizer: SimpleTokenizer,
+    text_length: int = 77,
+    truncate: bool = True,
+) -> torch.LongTensor:
+    start_token = tokenizer.encoder["<|startoftext|>"]
+    end_token = tokenizer.encoder["<|endoftext|>"]
+    tokens = [start_token] + tokenizer.encode(caption) + [end_token]
     result = torch.zeros(text_length, dtype=torch.long)
     if len(tokens) > text_length:
-        if truncate:
-            tokens = tokens[:text_length]
-            tokens[-1] = eot_token
-        else:
+        if not truncate:
             raise RuntimeError(
-                f"Input {caption} is too long for context length {text_length}"
+                f"Caption is too long for context length {text_length}: {caption}"
             )
-    result[:len(tokens)] = torch.tensor(tokens)
+        tokens = tokens[:text_length]
+        tokens[-1] = end_token
+    result[: len(tokens)] = torch.tensor(tokens)
     return result
 
-def _read_images(img_input):
-    if isinstance(img_input, str):
-        return read_image(img_input)
 
-    if isinstance(img_input, list):
-        return [read_image(p) for p in img_input]
+def _read_tracklet(frame_paths: list[str]):
+    if not isinstance(frame_paths, list) or not frame_paths:
+        raise TypeError("Video samples must contain a non-empty frame path list")
+    return [read_image(path) for path in frame_paths]
 
-    raise TypeError(f"Unsupported img_input type: {type(img_input)}")
 
-def _is_ir_sample(img_input):
-    sample_path = img_input[0] if isinstance(img_input, list) else img_input
-    if not isinstance(sample_path, str):
-        return False
-    normalized_path = sample_path.replace("\\", "/").lower()
-    return "/ir/" in normalized_path
+def _apply_transform(images: list[object], transform):
+    if transform is None:
+        return images
 
-def _maybe_apply_ir_grayscale(img_input, img, ir_grayscale):
-    if not ir_grayscale or not _is_ir_sample(img_input):
-        return img
+    # Every frame replays the first frame's RNG state so flips/crops/erasing are
+    # spatially consistent across the tracklet. The global RNG advances once.
+    torch_state = torch.get_rng_state()
+    random_state = random.getstate()
+    numpy_state = np.random.get_state()
+    transformed = []
+    next_torch_state = None
+    next_random_state = None
+    next_numpy_state = None
+    for frame_index, image in enumerate(images):
+        if frame_index > 0:
+            torch.set_rng_state(torch_state)
+            random.setstate(random_state)
+            np.random.set_state(numpy_state)
+        transformed.append(transform(image))
+        if frame_index == 0:
+            next_torch_state = torch.get_rng_state()
+            next_random_state = random.getstate()
+            next_numpy_state = np.random.get_state()
+    torch.set_rng_state(next_torch_state)
+    random.setstate(next_random_state)
+    np.random.set_state(next_numpy_state)
+    return torch.stack(transformed, dim=0)
 
-    if isinstance(img, list):
-        return [frame.convert('L').convert('RGB') for frame in img]
-
-    return img.convert('L').convert('RGB')
-
-def _apply_transform(img_input, transform):
-    if isinstance(img_input, list):
-        imgs = [transform(img) if transform is not None else img for img in img_input]
-        return torch.stack(imgs, dim=0)   # [T, C, H, W]
-
-    return transform(img_input) if transform is not None else img_input
 
 class ImageTextDataset(Dataset):
-    def __init__(self,
-                 dataset,
-                 transform=None,
-                 text_length: int = 77,
-                 truncate: bool = True,
-                 ir_grayscale: bool = False):
+    def __init__(
+        self,
+        dataset,
+        transform=None,
+        text_length: int = 77,
+        truncate: bool = True,
+    ):
         self.dataset = dataset
         self.transform = transform
         self.text_length = text_length
         self.truncate = truncate
-        self.ir_grayscale = ir_grayscale
         self.tokenizer = SimpleTokenizer()
 
     def __len__(self):
         return len(self.dataset)
 
     def __getitem__(self, index):
-        pid, image_id, img_path, caption = self.dataset[index]
-
-        img = _read_images(img_path)
-        img = _maybe_apply_ir_grayscale(img_path, img, self.ir_grayscale)
-        img = _apply_transform(img, self.transform)
-
-        tokens = tokenize(caption, tokenizer=self.tokenizer, text_length=self.text_length, truncate=self.truncate)
-
-        ret = {
-            'pids': pid,
-            'image_ids': image_id,
-            'images': img,
-            'caption_ids': tokens,
+        pid, image_id, frame_paths, caption, modality = self.dataset[index]
+        images = _apply_transform(_read_tracklet(frame_paths), self.transform)
+        caption_ids = tokenize(
+            caption,
+            tokenizer=self.tokenizer,
+            text_length=self.text_length,
+            truncate=self.truncate,
+        )
+        return {
+            "pids": int(pid),
+            "image_ids": int(image_id),
+            "images": images,
+            "caption_ids": caption_ids,
+            "modalities": int(modality),
         }
-
-        return ret
 
 
 class ImageDataset(Dataset):
-    def __init__(self, image_pids, img_paths, transform=None, ir_grayscale: bool = False):
+    def __init__(self, image_pids, img_paths, image_modalities, transform=None):
+        if not (len(image_pids) == len(img_paths) == len(image_modalities)):
+            raise ValueError("Gallery PID/path/modality lengths must match")
         self.image_pids = image_pids
         self.img_paths = img_paths
+        self.image_modalities = image_modalities
         self.transform = transform
-        self.ir_grayscale = ir_grayscale
 
     def __len__(self):
         return len(self.image_pids)
 
     def __getitem__(self, index):
-        pid, img_path = self.image_pids[index], self.img_paths[index]
-
-        img = _read_images(img_path)
-        img = _maybe_apply_ir_grayscale(img_path, img, self.ir_grayscale)
-        img = _apply_transform(img, self.transform)
-
-        return pid, img
+        images = _apply_transform(
+            _read_tracklet(self.img_paths[index]), self.transform
+        )
+        return (
+            int(self.image_pids[index]),
+            int(self.image_modalities[index]),
+            images,
+        )
 
 
 class TextDataset(Dataset):
-    def __init__(self,
-                 caption_pids,
-                 captions,
-                 text_length: int = 77,
-                 truncate: bool = True):
+    def __init__(
+        self,
+        caption_pids,
+        captions,
+        text_length: int = 77,
+        truncate: bool = True,
+    ):
+        if len(caption_pids) != len(captions):
+            raise ValueError("Caption PID/text lengths must match")
         self.caption_pids = caption_pids
         self.captions = captions
         self.text_length = text_length
@@ -160,90 +170,9 @@ class TextDataset(Dataset):
         return len(self.caption_pids)
 
     def __getitem__(self, index):
-        pid, caption = self.caption_pids[index], self.captions[index]
-
-        caption = tokenize(caption, tokenizer=self.tokenizer, text_length=self.text_length, truncate=self.truncate)
-
-        return pid, caption
-
-
-class ImageTextMLMDataset(Dataset):
-    def __init__(self,
-                 dataset,
-                 transform=None,
-                 text_length: int = 77,
-                 truncate: bool = True,
-                 ir_grayscale: bool = False):
-        self.dataset = dataset
-        self.transform = transform
-        self.text_length = text_length
-        self.truncate = truncate
-        self.ir_grayscale = ir_grayscale
-
-        self.tokenizer = SimpleTokenizer()
-
-    def __len__(self):
-        return len(self.dataset)
-
-    def __getitem__(self, index):
-        pid, image_id, img_path, caption = self.dataset[index]
-        img = _read_images(img_path)
-        img = _maybe_apply_ir_grayscale(img_path, img, self.ir_grayscale)
-        img = _apply_transform(img, self.transform)
-        
-        caption_tokens = tokenize(caption, tokenizer=self.tokenizer, text_length=self.text_length, truncate=self.truncate)
-
-        mlm_tokens, mlm_labels = self._build_random_masked_tokens_and_labels(caption_tokens.cpu().numpy())
-
-        ret = {
-            'pids': pid,
-            'image_ids': image_id,
-            'images': img,
-            'caption_ids': caption_tokens,
-            'mlm_ids': mlm_tokens,
-            'mlm_labels': mlm_labels
-        }
-
-        return ret
-
-    def _build_random_masked_tokens_and_labels(self, tokens):
-        """
-        Masking some random tokens for Language Model task with probabilities as in the original BERT paper.
-        :param tokens: list of int, tokenized sentence.
-        :return: (list of int, list of int), masked tokens and related labels for MLM prediction
-        """
-        mask = self.tokenizer.encoder["<|mask|>"]
-        token_range = list(range(1, len(self.tokenizer.encoder)-3)) # 1 ~ 49405
-        
-        labels = []
-        for i, token in enumerate(tokens):
-            if 0 < token < 49405:
-                prob = random.random()
-                # mask token with 15% probability
-                if prob < 0.15:
-                    prob /= 0.15
-
-                    # 80% randomly change token to mask token
-                    if prob < 0.8:
-                        tokens[i] = mask
-
-                    # 10% randomly change token to random token
-                    elif prob < 0.9:
-                        tokens[i] = random.choice(token_range)
-
-                    # -> rest 10% randomly keep current token
-
-                    # append current token to output (we will predict these later)
-                    labels.append(token)
-                else:
-                    # no masking token (will be ignored by loss function later)
-                    labels.append(0)
-            else:
-                labels.append(0)
-        
-        if all(l == 0 for l in labels):
-            # at least mask 1
-            labels[1] = tokens[1]
-            tokens[1] = mask
-
-        return torch.tensor(tokens), torch.tensor(labels)
+        return int(self.caption_pids[index]), tokenize(
+            self.captions[index],
+            tokenizer=self.tokenizer,
+            text_length=self.text_length,
+            truncate=self.truncate,
+        )

@@ -1,52 +1,57 @@
+from __future__ import annotations
+
+import logging
+
 import torch
 
 from .lr_scheduler import LRSchedulerWithWarmup
 
 
 def build_optimizer(args, model):
-    params = []
-
-    print(f'Using {args.lr_factor} times learning rate for random init module ')
-    
-    for key, value in model.named_parameters():
-        if not value.requires_grad:
+    logging.getLogger("IRRA.solver").info(
+        "Using %.3fx learning rate for the ID classifier",
+        args.lr_factor,
+    )
+    parameter_groups = []
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
             continue
-        lr = args.lr
+        learning_rate = args.lr
         weight_decay = args.weight_decay
-
-        if "cross" in key:
-            # use large learning rate for random initialized cross modal module
-            lr =  args.lr * args.lr_factor # default 5.0
-        if "bias" in key:
-            lr = args.lr * args.bias_lr_factor
+        if "bias" in name:
+            learning_rate *= args.bias_lr_factor
             weight_decay = args.weight_decay_bias
-        if "classifier" in key or "mlm_head" in key:
-            lr = args.lr * args.lr_factor
-        
-        params += [{"params": [value], "lr": lr, "weight_decay": weight_decay}]
+        if "classifier" in name:
+            learning_rate = args.lr * args.lr_factor
+        parameter_groups.append(
+            {
+                "params": [parameter],
+                "lr": learning_rate,
+                "weight_decay": weight_decay,
+            }
+        )
 
     if args.optimizer == "SGD":
-        optimizer = torch.optim.SGD(
-            params, lr=args.lr, momentum=args.momentum
+        return torch.optim.SGD(
+            parameter_groups,
+            lr=args.lr,
+            momentum=args.momentum,
         )
-    elif args.optimizer == "Adam":
-        optimizer = torch.optim.Adam(
-            params,
+    if args.optimizer == "Adam":
+        return torch.optim.Adam(
+            parameter_groups,
             lr=args.lr,
             betas=(args.alpha, args.beta),
             eps=1e-3,
         )
-    elif args.optimizer == "AdamW":
-        optimizer = torch.optim.AdamW(
-            params,
+    if args.optimizer == "AdamW":
+        return torch.optim.AdamW(
+            parameter_groups,
             lr=args.lr,
             betas=(args.alpha, args.beta),
             eps=1e-8,
         )
-    else:
-        NotImplementedError
-
-    return optimizer
+    raise ValueError(f"Unsupported optimizer: {args.optimizer}")
 
 
 def build_lr_scheduler(args, optimizer):

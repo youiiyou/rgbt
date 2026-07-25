@@ -19,21 +19,14 @@ class LRSchedulerWithWarmup(_LRScheduler):
         power=0.9,
         last_epoch=-1,
     ):
-        if not list(milestones) == sorted(milestones):
-            raise ValueError(
-                "Milestones should be a list of"
-                " increasing integers. Got {}".format(milestones),
-            )
+        if list(milestones) != sorted(milestones):
+            raise ValueError(f"Milestones must be increasing, got {milestones}")
         if mode not in ("step", "exp", "poly", "cosine", "linear"):
-            raise ValueError(
-                "Only 'step', 'exp', 'poly' or 'cosine' learning rate scheduler accepted"
-                "got {}".format(mode)
-            )
+            raise ValueError(f"Unsupported scheduler mode: {mode}")
         if warmup_method not in ("constant", "linear"):
-            raise ValueError(
-                "Only 'constant' or 'linear' warmup_method accepted"
-                "got {}".format(warmup_method)
-            )
+            raise ValueError(f"Unsupported warmup method: {warmup_method}")
+        if warmup_epochs < 0 or total_epochs < 1:
+            raise ValueError("warmup_epochs must be non-negative and total_epochs positive")
         self.milestones = milestones
         self.mode = mode
         self.gamma = gamma
@@ -46,7 +39,6 @@ class LRSchedulerWithWarmup(_LRScheduler):
         super().__init__(optimizer, last_epoch)
 
     def get_lr(self):
-
         if self.last_epoch < self.warmup_epochs:
             if self.warmup_method == "constant":
                 warmup_factor = self.warmup_factor
@@ -61,9 +53,9 @@ class LRSchedulerWithWarmup(_LRScheduler):
                 for base_lr in self.base_lrs
             ]
 
-        epoch_ratio = (self.last_epoch - self.warmup_epochs) / (
-            self.total_epochs - self.warmup_epochs
-        )
+        decay_epochs = max(1, self.total_epochs - self.warmup_epochs)
+        epoch_ratio = (self.last_epoch - self.warmup_epochs) / decay_epochs
+        epoch_ratio = min(max(epoch_ratio, 0.0), 1.0)
 
         if self.mode == "exp":
             factor = epoch_ratio
@@ -73,9 +65,9 @@ class LRSchedulerWithWarmup(_LRScheduler):
             return [base_lr * factor for base_lr in self.base_lrs]
 
         if self.mode == "poly":
-            factor = 1 - epoch_ratio
+            factor = (1 - epoch_ratio) ** self.power
             return [
-                self.target_lr + (base_lr - self.target_lr) * self.power ** factor
+                self.target_lr + (base_lr - self.target_lr) * factor
                 for base_lr in self.base_lrs
             ]
         if self.mode == "cosine":

@@ -1,35 +1,60 @@
-from prettytable import PrettyTable
-import os
-# os.environ['CUDA_VISIBLE_DEVICES'] = '3'
-import torch
-import numpy as np
-import time
-import os.path as op
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
 
 from datasets import build_dataloader
-from processor.processor import do_inference
-from utils.checkpoint import Checkpointer
-from utils.logger import setup_logger
 from model import build_model
-from utils.metrics import Evaluator
-import argparse
-from utils.iotools import load_train_configs
+from processor import do_inference
+from utils.checkpoint import Checkpointer
+from utils.experiment import (
+    normalize_loaded_config,
+    resolve_device,
+    result_metadata,
+    verify_annotation_snapshot,
+)
+from utils.iotools import load_train_configs, write_json
+from utils.logger import setup_logger
 
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="IRRA Test")
-    parser.add_argument("--config_file", default='logs/CUHK-PEDES/iira/configs.yaml')
-    args = parser.parse_args()
-    args = load_train_configs(args.config_file)
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Evaluate the video baseline")
+    parser.add_argument("--config_file", required=True)
+    parser.add_argument("--gallery_mode", choices=["rgb", "ir", "mixed"])
+    parser.add_argument("--checkpoint", default="")
+    parser.add_argument("--device", choices=["auto", "cuda", "cpu"])
+    cli_args = parser.parse_args()
 
+    args = load_train_configs(cli_args.config_file)
+    normalize_loaded_config(args)
     args.training = False
-    logger = setup_logger('IRRA', save_dir=args.output_dir, if_train=args.training)
-    logger.info(args)
-    device = "cuda"
+    args.gallery_mode = cli_args.gallery_mode or args.gallery_mode
+    if cli_args.device:
+        args.device = cli_args.device
+    device = resolve_device(args.device)
+    args.resolved_device = str(device)
+    if args.caption_source == "json":
+        verify_annotation_snapshot(args)
+    logger = setup_logger("IRRA", args.output_dir, if_train=False)
+    logger.info("Evaluation configuration: %s", args)
 
-    test_img_loader, test_txt_loader, num_classes = build_dataloader(args)
-    model = build_model(args, num_classes=num_classes)
-    checkpointer = Checkpointer(model)
-    checkpointer.load(f=op.join(args.output_dir, 'best.pth'))
+    image_loader, text_loader, num_classes = build_dataloader(args)
+    model = build_model(args, num_classes)
+    if device.type == "cpu":
+        model.float()
+    checkpoint_path = Path(
+        cli_args.checkpoint or Path(args.output_dir) / "best.pth"
+    ).resolve()
+    Checkpointer(model).load(str(checkpoint_path))
     model.to(device)
-    do_inference(model, test_img_loader, test_txt_loader)
+    metrics = do_inference(
+        model,
+        image_loader,
+        text_loader,
+        gallery_mode=args.gallery_mode,
+        include_reverse=args.bidirectional_eval,
+    )
+    metrics.update(result_metadata(args, checkpoint_path))
+    result_path = Path(args.output_dir) / f"eval_{args.gallery_mode}.json"
+    write_json(metrics, result_path)
+    logger.info("Saved metrics to %s", result_path)

@@ -1,101 +1,160 @@
-from prettytable import PrettyTable
-import torch
-import numpy as np
-import os
-import torch.nn.functional as F
+from __future__ import annotations
+
 import logging
 
+import torch
+from prettytable import PrettyTable
 
-def rank(similarity, q_pids, g_pids, max_rank=10, get_mAP=True):
-    if get_mAP:
-        indices = torch.argsort(similarity, dim=1, descending=True)
-    else:
-        # acclerate sort with topk
-        _, indices = torch.topk(
-            similarity, k=max_rank, dim=1, largest=True, sorted=True
-        )  # q * topk
-    pred_labels = g_pids[indices.cpu()]  # q * k
-    matches = pred_labels.eq(q_pids.view(-1, 1))  # q * k
-
-    all_cmc = matches[:, :max_rank].cumsum(1) # cumulative sum
-    all_cmc[all_cmc > 1] = 1
-    all_cmc = all_cmc.float().mean(0) * 100
-    # all_cmc = all_cmc[topk - 1]
-
-    if not get_mAP:
-        return all_cmc, indices
-
-    num_rel = matches.sum(1)  # q
-    tmp_cmc = matches.cumsum(1)  # q * k
-
-    inp = [tmp_cmc[i][match_row.nonzero()[-1]] / (match_row.nonzero()[-1] + 1.) for i, match_row in enumerate(matches)]
-    mINP = torch.cat(inp).mean() * 100
-
-    tmp_cmc = [tmp_cmc[:, i] / (i + 1.0) for i in range(tmp_cmc.shape[1])]
-    tmp_cmc = torch.stack(tmp_cmc, 1) * matches
-    AP = tmp_cmc.sum(1) / num_rel  # q
-    mAP = AP.mean() * 100
-
-    return all_cmc, mAP, mINP, indices
+from model.objectives import compute_similarity
 
 
-class Evaluator():
-    def __init__(self, img_loader, txt_loader):
-        self.img_loader = img_loader # gallery
-        self.txt_loader = txt_loader # query
+def rank(similarity, q_pids, g_pids, max_rank=10):
+    if similarity.ndim != 2:
+        raise ValueError("Similarity must be a two-dimensional matrix")
+    if similarity.shape != (len(q_pids), len(g_pids)):
+        raise ValueError("Similarity shape does not match query/gallery IDs")
+    if len(g_pids) == 0:
+        raise ValueError("Gallery is empty")
+
+    indices = torch.argsort(similarity, dim=1, descending=True)
+    predicted_pids = g_pids[indices.cpu()]
+    matches = predicted_pids.eq(q_pids.reshape(-1, 1))
+    relevant = matches.sum(dim=1)
+    if torch.any(relevant == 0):
+        missing = int((relevant == 0).sum().item())
+        raise ValueError(f"{missing} queries have no positive sample in the gallery")
+
+    effective_rank = min(max_rank, matches.shape[1])
+    cmc = matches[:, :effective_rank].cumsum(dim=1)
+    cmc[cmc > 1] = 1
+    cmc = cmc.float().mean(dim=0) * 100
+
+    cumulative = matches.cumsum(dim=1)
+    last_positive_precision = []
+    for row_index, match_row in enumerate(matches):
+        last_index = match_row.nonzero(as_tuple=False)[-1, 0]
+        last_positive_precision.append(
+            cumulative[row_index, last_index].float() / float(last_index + 1)
+        )
+    mean_inp = torch.stack(last_positive_precision).mean() * 100
+
+    positions = torch.arange(
+        1, matches.shape[1] + 1, dtype=torch.float32, device=matches.device
+    )
+    precision_at_rank = cumulative.float() / positions.reshape(1, -1)
+    average_precision = (precision_at_rank * matches).sum(dim=1) / relevant
+    mean_ap = average_precision.mean() * 100
+    return cmc.cpu(), float(mean_ap.item()), float(mean_inp.item()), indices
+
+
+def _rank_value(cmc, rank_index):
+    return float(cmc[min(rank_index - 1, len(cmc) - 1)].item())
+
+
+class Evaluator:
+    def __init__(self, img_loader, txt_loader, gallery_mode="mixed"):
+        self.img_loader = img_loader
+        self.txt_loader = txt_loader
+        self.gallery_mode = gallery_mode
         self.logger = logging.getLogger("IRRA.eval")
 
     def _compute_embedding(self, model):
-        model = model.eval()
+        model.eval()
         device = next(model.parameters()).device
+        query_ids, gallery_ids, modalities = [], [], []
+        text_features, image_features = [], []
 
-        qids, gids, qfeats, gfeats = [], [], [], []
-        # text
-        for pid, caption in self.txt_loader:
-            caption = caption.to(device)
+        for pid, caption_ids in self.txt_loader:
             with torch.no_grad():
-                text_feat = model.encode_text(caption)
-            qids.append(pid.view(-1)) # flatten 
-            qfeats.append(text_feat)
-        qids = torch.cat(qids, 0)
-        qfeats = torch.cat(qfeats, 0)
+                features = model.encode_text(caption_ids.to(device))
+            query_ids.append(pid.reshape(-1))
+            text_features.append(features)
 
-        # image
-        for pid, img in self.img_loader:
-            img = img.to(device)
+        for pid, modality, images in self.img_loader:
             with torch.no_grad():
-                img_feat = model.encode_image(img)
-            gids.append(pid.view(-1)) # flatten 
-            gfeats.append(img_feat)
-        gids = torch.cat(gids, 0)
-        gfeats = torch.cat(gfeats, 0)
+                features = model.encode_image(images.to(device))
+            gallery_ids.append(pid.reshape(-1))
+            modalities.append(modality.reshape(-1))
+            image_features.append(features)
 
-        return qfeats, gfeats, qids, gids
-    
-    def eval(self, model, i2t_metric=False):
+        return (
+            torch.cat(text_features, dim=0),
+            torch.cat(image_features, dim=0),
+            torch.cat(query_ids, dim=0),
+            torch.cat(gallery_ids, dim=0),
+            torch.cat(modalities, dim=0),
+        )
 
-        qfeats, gfeats, qids, gids = self._compute_embedding(model)
+    def eval(self, model, include_reverse=True):
+        text_features, image_features, query_ids, gallery_ids, modalities = (
+            self._compute_embedding(model)
+        )
+        similarity = compute_similarity(text_features, image_features)
+        rgb_count = int((modalities == 0).sum().item())
+        ir_count = int((modalities == 1).sum().item())
+        if rgb_count + ir_count != len(modalities):
+            raise ValueError("Gallery contains an unsupported modality")
 
-        qfeats = F.normalize(qfeats, p=2, dim=1) # text features
-        gfeats = F.normalize(gfeats, p=2, dim=1) # image features
+        cmc, mean_ap, mean_inp, _ = rank(
+            similarity, query_ids, gallery_ids, max_rank=10
+        )
+        metrics = {
+            "task": "text-to-video",
+            "gallery_mode": self.gallery_mode,
+            "num_queries": int(len(query_ids)),
+            "num_gallery": int(len(gallery_ids)),
+            "num_rgb_gallery": rgb_count,
+            "num_ir_gallery": ir_count,
+            "R1": _rank_value(cmc, 1),
+            "R5": _rank_value(cmc, 5),
+            "R10": _rank_value(cmc, 10),
+            "mAP": mean_ap,
+            "mINP": mean_inp,
+        }
 
-        similarity = qfeats @ gfeats.t()
-
-        t2i_cmc, t2i_mAP, t2i_mINP, _ = rank(similarity=similarity, q_pids=qids, g_pids=gids, max_rank=10, get_mAP=True)
-        t2i_cmc, t2i_mAP, t2i_mINP = t2i_cmc.numpy(), t2i_mAP.numpy(), t2i_mINP.numpy()
         table = PrettyTable(["task", "R1", "R5", "R10", "mAP", "mINP"])
-        table.add_row(['t2i', t2i_cmc[0], t2i_cmc[4], t2i_cmc[9], t2i_mAP, t2i_mINP])
+        table.add_row(
+            [
+                f"t2v-{self.gallery_mode}",
+                metrics["R1"],
+                metrics["R5"],
+                metrics["R10"],
+                metrics["mAP"],
+                metrics["mINP"],
+            ]
+        )
+        if include_reverse:
+            reverse_cmc, reverse_map, reverse_minp, _ = rank(
+                similarity.t(), gallery_ids, query_ids, max_rank=10
+            )
+            metrics["reverse"] = {
+                "task": "video-to-text",
+                "R1": _rank_value(reverse_cmc, 1),
+                "R5": _rank_value(reverse_cmc, 5),
+                "R10": _rank_value(reverse_cmc, 10),
+                "mAP": reverse_map,
+                "mINP": reverse_minp,
+            }
+            table.add_row(
+                [
+                    f"v2t-{self.gallery_mode}",
+                    metrics["reverse"]["R1"],
+                    metrics["reverse"]["R5"],
+                    metrics["reverse"]["R10"],
+                    metrics["reverse"]["mAP"],
+                    metrics["reverse"]["mINP"],
+                ]
+            )
 
-        if i2t_metric:
-            i2t_cmc, i2t_mAP, i2t_mINP, _ = rank(similarity=similarity.t(), q_pids=gids, g_pids=qids, max_rank=10, get_mAP=True)
-            i2t_cmc, i2t_mAP, i2t_mINP = i2t_cmc.numpy(), i2t_mAP.numpy(), i2t_mINP.numpy()
-            table.add_row(['i2t', i2t_cmc[0], i2t_cmc[4], i2t_cmc[9], i2t_mAP, i2t_mINP])
-        # table.float_format = '.4'
-        table.custom_format["R1"] = lambda f, v: f"{v:.3f}"
-        table.custom_format["R5"] = lambda f, v: f"{v:.3f}"
-        table.custom_format["R10"] = lambda f, v: f"{v:.3f}"
-        table.custom_format["mAP"] = lambda f, v: f"{v:.3f}"
-        table.custom_format["mINP"] = lambda f, v: f"{v:.3f}"
-        self.logger.info('\n' + str(table))
-        
-        return t2i_cmc[0]
+        for column in ("R1", "R5", "R10", "mAP", "mINP"):
+            table.custom_format[column] = lambda _field, value: f"{value:.3f}"
+        self.logger.info(
+            "Gallery=%s queries=%d gallery=%d (rgb=%d ir=%d)\n%s",
+            self.gallery_mode,
+            len(query_ids),
+            len(gallery_ids),
+            rgb_count,
+            ir_count,
+            table,
+        )
+        return metrics

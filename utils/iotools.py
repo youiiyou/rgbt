@@ -1,76 +1,63 @@
-# encoding: utf-8
-"""
-@author:  sherlock
-@contact: sherlockliao01@gmail.com
-"""
-from PIL import Image, ImageFile
-import errno
+from __future__ import annotations
+
 import json
-import pickle as pkl
-import os
-import os.path as osp
+from pathlib import Path
+
 import yaml
-from easydict import EasyDict as edict
+from easydict import EasyDict
+from PIL import Image, ImageFile
+
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 
+class ConfigLoader(yaml.SafeLoader):
+    """Safe YAML loader with the tuple tag emitted by historical IRRA configs."""
+
+
+def _construct_python_tuple(loader, node):
+    return tuple(loader.construct_sequence(node))
+
+
+ConfigLoader.add_constructor(
+    "tag:yaml.org,2002:python/tuple",
+    _construct_python_tuple,
+)
+
+
 def read_image(img_path):
-    """Keep reading image until succeed.
-    This can avoid IOError incurred by heavy IO process."""
-    got_img = False
-    if not osp.exists(img_path):
-        raise IOError("{} does not exist".format(img_path))
-    while not got_img:
-        try:
-            img = Image.open(img_path).convert('RGB')
-            got_img = True
-        except IOError:
-            print("IOError incurred when reading '{}'. Will redo. Don't worry. Just chill.".format(img_path))
-            pass
-    return img
+    path = Path(img_path)
+    if not path.is_file():
+        raise FileNotFoundError(f"Image does not exist: {path}")
+    with Image.open(path) as image:
+        return image.convert("RGB")
 
 
 def mkdir_if_missing(directory):
-    if not osp.exists(directory):
-        try:
-            os.makedirs(directory)
-        except OSError as e:
-            if e.errno != errno.EEXIST:
-                raise
+    if directory:
+        Path(directory).mkdir(parents=True, exist_ok=True)
 
 
-def check_isfile(path):
-    isfile = osp.isfile(path)
-    if not isfile:
-        print("=> Warning: no file found at '{}' (ignored)".format(path))
-    return isfile
+def read_json(path):
+    return json.loads(Path(path).read_text(encoding="utf-8"))
 
 
-def read_json(fpath):
-    with open(fpath, 'r') as f:
-        obj = json.load(f)
-    return obj
-
-
-def write_json(obj, fpath):
-    mkdir_if_missing(osp.dirname(fpath))
-    with open(fpath, 'w') as f:
-        json.dump(obj, f, indent=4, separators=(',', ': '))
-
-
-def get_text_embedding(path, length):
-    with open(path, 'rb') as f:
-        word_frequency = pkl.load(f)
+def write_json(obj, path):
+    output = Path(path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(
+        json.dumps(obj, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
 
 
 def save_train_configs(path, args):
-    if not os.path.exists(path):
-        os.makedirs(path)
-    with open(f'{path}/configs.yaml', 'w') as f:
-        yaml.dump(vars(args), f, default_flow_style=False)
+    output = Path(path)
+    output.mkdir(parents=True, exist_ok=True)
+    with (output / "configs.yaml").open("w", encoding="utf-8") as handle:
+        yaml.safe_dump(vars(args), handle, default_flow_style=False, sort_keys=True)
+
 
 def load_train_configs(path):
-    with open(path, 'r') as f:
-        args = yaml.load(f, Loader=yaml.FullLoader)
-    return edict(args)
+    with Path(path).open("r", encoding="utf-8") as handle:
+        return EasyDict(yaml.load(handle, Loader=ConfigLoader))

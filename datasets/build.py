@@ -1,181 +1,197 @@
+from __future__ import annotations
+
 import logging
+
 import torch
-import torchvision.transforms as T
+import torchvision.transforms as transforms
 from torch.utils.data import DataLoader
-from datasets.sampler import RandomIdentitySampler
-from datasets.sampler_ddp import RandomIdentitySampler_DDP
 from torch.utils.data.distributed import DistributedSampler
 
 from utils.comm import get_world_size
 
-from .bases import ImageDataset, TextDataset, ImageTextDataset, ImageTextMLMDataset
-
-from .cuhkpedes import CUHKPEDES
-from .icfgpedes import ICFGPEDES
-from .rstpreid import RSTPReid
+from .bases import ImageDataset, ImageTextDataset, TextDataset
+from .bupt import BUPT
+from .sampler import RandomIdentitySampler
+from .sampler_ddp import RandomIdentitySampler_DDP
 from .vcm import VCM
 
-__factory = {'CUHK-PEDES': CUHKPEDES, 'ICFG-PEDES': ICFGPEDES, 'RSTPReid': RSTPReid, 'VCM': VCM}
+
+DATASET_FACTORY = {"VCM": VCM, "BUPT": BUPT}
 
 
 def build_transforms(img_size=(384, 128), aug=False, is_train=True):
     height, width = img_size
-
     mean = [0.48145466, 0.4578275, 0.40821073]
     std = [0.26862954, 0.26130258, 0.27577711]
-
     if not is_train:
-        transform = T.Compose([
-            T.Resize((height, width)),
-            T.ToTensor(),
-            T.Normalize(mean=mean, std=std),
-        ])
-        return transform
+        return transforms.Compose(
+            [
+                transforms.Resize((height, width)),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=mean, std=std),
+            ]
+        )
 
-    # transform for training
+    operations = [
+        transforms.Resize((height, width)),
+        transforms.RandomHorizontalFlip(0.5),
+    ]
     if aug:
-        transform = T.Compose([
-            T.Resize((height, width)),
-            T.RandomHorizontalFlip(0.5),
-            T.Pad(10),
-            T.RandomCrop((height, width)),
-            T.ToTensor(),
-            T.Normalize(mean=mean, std=std),
-            T.RandomErasing(scale=(0.02, 0.4), value=mean),
-        ])
-    else:
-        transform = T.Compose([
-            T.Resize((height, width)),
-            T.RandomHorizontalFlip(0.5),
-            T.ToTensor(),
-            T.Normalize(mean=mean, std=std),
-        ])
-    return transform
+        operations.extend(
+            [
+                transforms.Pad(10),
+                transforms.RandomCrop((height, width)),
+            ]
+        )
+    operations.extend(
+        [
+            transforms.ToTensor(),
+            transforms.Normalize(mean=mean, std=std),
+        ]
+    )
+    if aug:
+        operations.append(transforms.RandomErasing(scale=(0.02, 0.4), value=mean))
+    return transforms.Compose(operations)
 
 
 def collate(batch):
-    keys = set([key for b in batch for key in b.keys()])
-    # turn list of dicts data structure to dict of lists data structure
-    dict_batch = {k: [dic[k] if k in dic else None for dic in batch] for k in keys}
-
-    batch_tensor_dict = {}
-    for k, v in dict_batch.items():
-        if isinstance(v[0], int):
-            batch_tensor_dict.update({k: torch.tensor(v)})
-        elif torch.is_tensor(v[0]):
-             batch_tensor_dict.update({k: torch.stack(v)})
+    keys = set().union(*(sample.keys() for sample in batch))
+    tensor_batch = {}
+    for key in keys:
+        values = [sample[key] for sample in batch]
+        if isinstance(values[0], int):
+            tensor_batch[key] = torch.tensor(values, dtype=torch.long)
+        elif torch.is_tensor(values[0]):
+            tensor_batch[key] = torch.stack(values)
         else:
-            raise TypeError(f"Unexpect data type: {type(v[0])} in a batch.")
+            raise TypeError(f"Unsupported batch value for {key}: {type(values[0])}")
+    return tensor_batch
 
-    return batch_tensor_dict
 
-def build_dataloader(args, tranforms=None):
-    logger = logging.getLogger("IRRA.dataset")
-
-    num_workers = args.num_workers
-    if args.dataset_name == 'VCM':
-        dataset = __factory[args.dataset_name](
-            root=args.root_dir,
-            num_frames=args.num_frames,
-            train_caption_mode=getattr(args, 'train_caption_mode', 'double')
+def build_dataset(args):
+    if args.dataset_name not in DATASET_FACTORY:
+        raise ValueError(
+            f"Unsupported dataset {args.dataset_name!r}; choose from {sorted(DATASET_FACTORY)}"
         )
-    else:
-        dataset = __factory[args.dataset_name](root=args.root_dir)
+    common = {
+        "root": args.root_dir,
+        "annotation_file": getattr(args, "annotation_file", ""),
+        "num_frames": args.num_frames,
+        "train_caption_mode": args.train_caption_mode,
+    }
+    if args.dataset_name == "VCM":
+        common["caption_source"] = getattr(args, "caption_source", "legacy")
+    elif getattr(args, "caption_source", "json") != "json":
+        raise ValueError("BUPT supports only JSON captions")
+    if args.dataset_name == "BUPT":
+        common["protocol_dir"] = getattr(args, "protocol_dir", "") or None
+    return DATASET_FACTORY[args.dataset_name](**common)
+
+
+def _eval_split(dataset, split_name, gallery_mode):
+    return dataset.get_eval_split(split_name, gallery_mode)
+
+
+def _build_eval_loaders(args, dataset, split_name, gallery_mode, transform):
+    split = _eval_split(dataset, split_name, gallery_mode)
+    image_set = ImageDataset(
+        split["image_pids"],
+        split["img_paths"],
+        split["image_modalities"],
+        transform=transform,
+    )
+    text_set = TextDataset(
+        split["caption_pids"],
+        split["captions"],
+        text_length=args.text_length,
+    )
+    image_loader = DataLoader(
+        image_set,
+        batch_size=args.test_batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=str(args.resolved_device).startswith("cuda"),
+    )
+    text_loader = DataLoader(
+        text_set,
+        batch_size=args.test_batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=str(args.resolved_device).startswith("cuda"),
+    )
+    return image_loader, text_loader
+
+
+def build_dataloader(args, custom_transforms=None):
+    logger = logging.getLogger("IRRA.dataset")
+    dataset = build_dataset(args)
     num_classes = len(dataset.train_id_container)
-    
+    args.dataset_metadata = dict(dataset.metadata)
+    args.num_train_ids = len(dataset.train_id_container)
+    args.num_train_tracklets = len(dataset.train_tracklets)
+    args.num_train_samples = len(dataset.train)
+    args.num_queries = len(dataset.queries)
+    args.num_gallery_rgb = len(dataset.gallery_rgb)
+    args.num_gallery_ir = len(dataset.gallery_ir)
+    args.num_gallery_mixed = len(dataset.gallery_mixed)
+    if getattr(args, "caption_source", "json") == "legacy":
+        args.annotation_source_path = "legacy-directory-captions"
+        args.annotation_snapshot_path = ""
+        args.annotation_sha256 = dataset.metadata["annotation_sha256"]
+    logger.info("Dataset metadata: %s", dataset.metadata)
+
     if args.training:
-        train_transforms = build_transforms(img_size=args.img_size,
-                                            aug=args.img_aug,
-                                            is_train=True)
-        val_transforms = build_transforms(img_size=args.img_size,
-                                          is_train=False)
+        train_transform = build_transforms(args.img_size, args.img_aug, is_train=True)
+        eval_transform = build_transforms(args.img_size, is_train=False)
+        train_set = ImageTextDataset(
+            dataset.train,
+            transform=train_transform,
+            text_length=args.text_length,
+        )
 
-        if args.MLM:
-            train_set = ImageTextMLMDataset(dataset.train,
-                                     train_transforms,
-                                     text_length=args.text_length,
-                                     ir_grayscale=args.ir_grayscale)
-        else:
-            train_set = ImageTextDataset(dataset.train,
-                                     train_transforms,
-                                     text_length=args.text_length,
-                                     ir_grayscale=args.ir_grayscale)
-
-        if args.sampler == 'identity':
+        sampler = None
+        shuffle = False
+        if args.sampler == "identity":
             if args.distributed:
-                logger.info('using ddp random identity sampler')
-                logger.info('DISTRIBUTED TRAIN START')
-                mini_batch_size = args.batch_size // get_world_size()
-                # TODO wait to fix bugs
-                data_sampler = RandomIdentitySampler_DDP(
-                    dataset.train, args.batch_size, args.num_instance)
-                batch_sampler = torch.utils.data.sampler.BatchSampler(
-                    data_sampler, mini_batch_size, True)
-
-            else:
-                logger.info(
-                    f'using random identity sampler: batch_size: {args.batch_size}, id: {args.batch_size // args.num_instance}, instance: {args.num_instance}'
+                sampler = RandomIdentitySampler_DDP(
+                    dataset.train,
+                    args.batch_size * get_world_size(),
+                    args.num_instance,
+                    seed=args.seed,
                 )
-                train_loader = DataLoader(train_set,
-                                          batch_size=args.batch_size,
-                                          sampler=RandomIdentitySampler(
-                                              dataset.train, args.batch_size,
-                                              args.num_instance),
-                                          num_workers=num_workers,
-                                          collate_fn=collate)
-        elif args.sampler == 'random':
-            # TODO add distributed condition
-            logger.info('using random sampler')
-            train_loader = DataLoader(train_set,
-                                      batch_size=args.batch_size,
-                                      shuffle=True,
-                                      num_workers=num_workers,
-                                      collate_fn=collate)
+            else:
+                sampler = RandomIdentitySampler(
+                    dataset.train,
+                    args.batch_size,
+                    args.num_instance,
+                    seed=args.seed,
+                )
+        elif args.sampler == "random":
+            if args.distributed:
+                sampler = DistributedSampler(train_set, shuffle=True)
+            else:
+                shuffle = True
         else:
-            logger.error('unsupported sampler! expected softmax or triplet but got {}'.format(args.sampler))
+            raise ValueError(f"Unsupported sampler: {args.sampler}")
 
-        # use test set as validate set
-        ds = dataset.val if args.val_dataset == 'val' else dataset.test
-        val_img_set = ImageDataset(ds['image_pids'], ds['img_paths'],
-                                   val_transforms,
-                                   ir_grayscale=args.ir_grayscale)
-        val_txt_set = TextDataset(ds['caption_pids'],
-                                  ds['captions'],
-                                  text_length=args.text_length)
-
-        val_img_loader = DataLoader(val_img_set,
-                                    batch_size=args.batch_size,
-                                    shuffle=False,
-                                    num_workers=num_workers)
-        val_txt_loader = DataLoader(val_txt_set,
-                                    batch_size=args.batch_size,
-                                    shuffle=False,
-                                    num_workers=num_workers)
-
+        train_loader = DataLoader(
+            train_set,
+            batch_size=args.batch_size,
+            sampler=sampler,
+            shuffle=shuffle,
+            num_workers=args.num_workers,
+            collate_fn=collate,
+            pin_memory=str(args.resolved_device).startswith("cuda"),
+            persistent_workers=args.num_workers > 0,
+        )
+        split_name = "val" if args.val_dataset == "val" else "test"
+        val_img_loader, val_txt_loader = _build_eval_loaders(
+            args, dataset, split_name, "mixed", eval_transform
+        )
         return train_loader, val_img_loader, val_txt_loader, num_classes
 
-    else:
-        # build dataloader for testing
-        if tranforms:
-            test_transforms = tranforms
-        else:
-            test_transforms = build_transforms(img_size=args.img_size,
-                                               is_train=False)
-
-        ds = dataset.test
-        test_img_set = ImageDataset(ds['image_pids'], ds['img_paths'],
-                                    test_transforms,
-                                    ir_grayscale=args.ir_grayscale)
-        test_txt_set = TextDataset(ds['caption_pids'],
-                                   ds['captions'],
-                                   text_length=args.text_length)
-
-        test_img_loader = DataLoader(test_img_set,
-                                     batch_size=args.test_batch_size,
-                                     shuffle=False,
-                                     num_workers=num_workers)
-        test_txt_loader = DataLoader(test_txt_set,
-                                     batch_size=args.test_batch_size,
-                                     shuffle=False,
-                                     num_workers=num_workers)
-        return test_img_loader, test_txt_loader, num_classes
+    test_transform = custom_transforms or build_transforms(args.img_size, is_train=False)
+    test_img_loader, test_txt_loader = _build_eval_loaders(
+        args, dataset, "test", args.gallery_mode, test_transform
+    )
+    return test_img_loader, test_txt_loader, num_classes

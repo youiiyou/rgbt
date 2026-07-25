@@ -1,67 +1,83 @@
-from torch.utils.data.sampler import Sampler
-from collections import defaultdict
-import copy
+from __future__ import annotations
+
 import random
-import numpy as np
+from collections import defaultdict
+from typing import Sequence
 
-class RandomIdentitySampler(Sampler):
-    """
-    Randomly sample N identities, then for each identity,
-    randomly sample K instances, therefore batch size is N*K.
-    Args:
-    - data_source (list): list of (img_path, pid, camid).
-    - num_instances (int): number of instances per identity in a batch.
-    - batch_size (int): number of examples in a batch.
-    """
+from torch.utils.data import Sampler
 
-    def __init__(self, data_source, batch_size, num_instances):
+
+class RandomIdentitySampler(Sampler[int]):
+    """Sample identity-balanced mini-batches from five-field video samples."""
+
+    def __init__(
+        self,
+        data_source: Sequence[tuple],
+        batch_size: int,
+        num_instances: int,
+        seed: int = 1,
+    ):
+        if batch_size < 1 or num_instances < 1:
+            raise ValueError("batch_size and num_instances must be positive")
+        if batch_size < num_instances:
+            raise ValueError("batch_size must be at least num_instances")
+        if batch_size % num_instances != 0:
+            raise ValueError("batch_size must be divisible by num_instances")
         self.data_source = data_source
-        self.batch_size = batch_size
-        self.num_instances = num_instances
+        self.batch_size = int(batch_size)
+        self.num_instances = int(num_instances)
         self.num_pids_per_batch = self.batch_size // self.num_instances
-        self.index_dic = defaultdict(list) #dict with list value
-        #{783: [0, 5, 116, 876, 1554, 2041],...,}
-        for index, (pid, _, _, _) in enumerate(self.data_source):
-            self.index_dic[pid].append(index)
-        self.pids = list(self.index_dic.keys())
+        self.seed = int(seed)
+        self.epoch = 0
+        self.index_dic: dict[int, list[int]] = defaultdict(list)
+        for index, sample in enumerate(data_source):
+            if len(sample) < 1:
+                raise ValueError("Every sample must contain a PID in field 0")
+            self.index_dic[int(sample[0])].append(index)
+        if len(self.index_dic) < self.num_pids_per_batch:
+            raise ValueError(
+                "Not enough identities for one identity-balanced batch: "
+                f"need {self.num_pids_per_batch}, got {len(self.index_dic)}"
+            )
 
-        # estimate number of examples in an epoch
-        self.length = 0
-        for pid in self.pids:
-            idxs = self.index_dic[pid]
-            num = len(idxs)
-            if num < self.num_instances:
-                num = self.num_instances
-            self.length += num - num % self.num_instances
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
+    def _build_chunks(self, rng: random.Random) -> dict[int, list[list[int]]]:
+        chunks: dict[int, list[list[int]]] = {}
+        for pid, source_indices in self.index_dic.items():
+            indices = list(source_indices)
+            if len(indices) < self.num_instances:
+                indices.extend(
+                    rng.choices(indices, k=self.num_instances - len(indices))
+                )
+            rng.shuffle(indices)
+            remainder = len(indices) % self.num_instances
+            if remainder:
+                indices.extend(rng.choices(indices, k=self.num_instances - remainder))
+            chunks[pid] = [
+                indices[start : start + self.num_instances]
+                for start in range(0, len(indices), self.num_instances)
+            ]
+        return chunks
+
+    def _generate_indices(self, epoch: int) -> list[int]:
+        rng = random.Random(self.seed + int(epoch))
+        chunks = self._build_chunks(rng)
+        active = list(chunks)
+        result: list[int] = []
+        while len(active) >= self.num_pids_per_batch:
+            rng.shuffle(active)
+            active.sort(key=lambda pid: len(chunks[pid]), reverse=True)
+            selected = active[: self.num_pids_per_batch]
+            for pid in selected:
+                result.extend(chunks[pid].pop(0))
+                if not chunks[pid]:
+                    active.remove(pid)
+        return result
 
     def __iter__(self):
-        batch_idxs_dict = defaultdict(list)
+        return iter(self._generate_indices(self.epoch))
 
-        for pid in self.pids:
-            idxs = copy.deepcopy(self.index_dic[pid])
-            if len(idxs) < self.num_instances:
-                idxs = np.random.choice(idxs, size=self.num_instances, replace=True)
-            random.shuffle(idxs)
-            batch_idxs = []
-            for idx in idxs:
-                batch_idxs.append(idx)
-                if len(batch_idxs) == self.num_instances:
-                    batch_idxs_dict[pid].append(batch_idxs)
-                    batch_idxs = []
-
-        avai_pids = copy.deepcopy(self.pids)
-        final_idxs = []
-
-        while len(avai_pids) >= self.num_pids_per_batch:
-            selected_pids = random.sample(avai_pids, self.num_pids_per_batch)
-            for pid in selected_pids:
-                batch_idxs = batch_idxs_dict[pid].pop(0)
-                final_idxs.extend(batch_idxs)
-                if len(batch_idxs_dict[pid]) == 0:
-                    avai_pids.remove(pid)
-
-        return iter(final_idxs)
-
-    def __len__(self):
-        return self.length
-
+    def __len__(self) -> int:
+        return len(self._generate_indices(self.epoch))

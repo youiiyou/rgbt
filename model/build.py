@@ -1,179 +1,151 @@
-from model import objectives
-from .clip_model import Transformer, QuickGELU, LayerNorm, build_CLIP_from_openai_pretrained, convert_weights
-import numpy as np
+from __future__ import annotations
+
 import torch
 import torch.nn as nn
-from collections import OrderedDict
+
+from . import objectives
+from .clip_model import build_CLIP_from_openai_pretrained, convert_weights
 
 
 class IRRA(nn.Module):
-    def __init__(self, args, num_classes=11003):
+    """Shared-text IRRA video baseline with uniform frame averaging."""
+
+    SUPPORTED_TASKS = {"sdm", "id"}
+
+    def __init__(self, args, num_classes: int):
         super().__init__()
         self.args = args
-        self.num_classes = num_classes
-        self._set_task()
+        self.num_classes = int(num_classes)
+        self.current_task = [
+            name.strip() for name in args.loss_names.split("+") if name.strip()
+        ]
+        unsupported = set(self.current_task) - self.SUPPORTED_TASKS
+        if unsupported:
+            raise ValueError(
+                f"Baseline supports only {sorted(self.SUPPORTED_TASKS)}, got {sorted(unsupported)}"
+            )
+        if not self.current_task:
+            raise ValueError("At least one baseline loss must be enabled")
+        if not str(args.pretrain_choice).startswith("ViT"):
+            raise ValueError(
+                "The video baseline requires a CLIP ViT backbone because it averages "
+                "per-frame CLS tokens"
+            )
 
-        self.base_model, base_cfg = build_CLIP_from_openai_pretrained(args.pretrain_choice, args.img_size, args.stride_size)
-        self.embed_dim = base_cfg['embed_dim']
+        self.base_model, base_config = build_CLIP_from_openai_pretrained(
+            args.pretrain_choice,
+            args.img_size,
+            args.stride_size,
+        )
+        self.embed_dim = int(base_config["embed_dim"])
+        self.register_buffer(
+            "logit_scale",
+            torch.tensor(1.0 / float(args.temperature), dtype=torch.float32),
+        )
 
-        self.logit_scale = torch.ones([]) * (1 / args.temperature) 
-
-        if 'id' in args.loss_names:
+        if "id" in self.current_task:
             self.classifier = nn.Linear(self.embed_dim, self.num_classes)
-            nn.init.normal_(self.classifier.weight.data, std=0.001)
-            nn.init.constant_(self.classifier.bias.data, val=0.0)
+            nn.init.normal_(self.classifier.weight, std=0.001)
+            nn.init.zeros_(self.classifier.bias)
 
-        if 'mlm' in args.loss_names:
-            self.cross_attn = nn.MultiheadAttention(self.embed_dim,
-                                                    self.embed_dim // 64,
-                                                    batch_first=True)
-            self.cross_modal_transformer = Transformer(width=self.embed_dim,
-                                                       layers=args.cmt_depth,
-                                                       heads=self.embed_dim //
-                                                       64)
-            scale = self.cross_modal_transformer.width**-0.5
-            
-            self.ln_pre_t = LayerNorm(self.embed_dim)
-            self.ln_pre_i = LayerNorm(self.embed_dim)
-            self.ln_post = LayerNorm(self.embed_dim)
+        print(f"Training shared-text video baseline with {self.current_task}")
 
-            proj_std = scale * ((2 * self.cross_modal_transformer.layers)**-0.5)
-            attn_std = scale
-            fc_std = (2 * self.cross_modal_transformer.width)**-0.5
-            for block in self.cross_modal_transformer.resblocks:
-                nn.init.normal_(block.attn.in_proj_weight, std=attn_std)
-                nn.init.normal_(block.attn.out_proj.weight, std=proj_std)
-                nn.init.normal_(block.mlp.c_fc.weight, std=fc_std)
-                nn.init.normal_(block.mlp.c_proj.weight, std=proj_std)
+    def _encode_frame_tokens(self, images: torch.Tensor) -> torch.Tensor:
+        if images.ndim == 4:
+            if int(self.args.num_frames) != 1:
+                raise ValueError(
+                    f"Configured {self.args.num_frames} frames but received a 4D image batch"
+                )
+            tokens = self.base_model.encode_image(images)
+            if tokens.ndim != 3:
+                raise ValueError(
+                    f"Expected ViT image tokens [B,L,D], got {tuple(tokens.shape)}"
+                )
+            return tokens.unsqueeze(1)
+        if images.ndim != 5:
+            raise ValueError(
+                f"Expected images [B,T,C,H,W] or [B,C,H,W], got {tuple(images.shape)}"
+            )
+        batch_size, num_frames, channels, height, width = images.shape
+        if num_frames != int(self.args.num_frames):
+            raise ValueError(
+                f"Configured {self.args.num_frames} frames but received {num_frames}"
+            )
+        flat_images = images.reshape(
+            batch_size * num_frames, channels, height, width
+        )
+        tokens = self.base_model.encode_image(flat_images)
+        if tokens.ndim != 3:
+            raise ValueError(
+                f"Expected ViT image tokens [B*T,L,D], got {tuple(tokens.shape)}"
+            )
+        token_count, embed_dim = tokens.shape[1:]
+        return tokens.reshape(
+            batch_size, num_frames, token_count, embed_dim
+        )
 
-            # init cross attn
-            nn.init.normal_(self.cross_attn.in_proj_weight, std=attn_std)
-            nn.init.normal_(self.cross_attn.out_proj.weight, std=proj_std)
+    def encode_image(self, images: torch.Tensor) -> torch.Tensor:
+        frame_tokens = self._encode_frame_tokens(images)
+        frame_cls = frame_tokens[:, :, 0, :].float()
+        return frame_cls.mean(dim=1)
 
-            self.mlm_head = nn.Sequential(
-                OrderedDict([('dense', nn.Linear(self.embed_dim, self.embed_dim)),
-                            ('gelu', QuickGELU()),
-                            ('ln', LayerNorm(self.embed_dim)),
-                            ('fc', nn.Linear(self.embed_dim, args.vocab_size))]))
-            # init mlm head
-            nn.init.normal_(self.mlm_head.dense.weight, std=fc_std)
-            nn.init.normal_(self.mlm_head.fc.weight, std=proj_std)
-
-    def _set_task(self):
-        loss_names = self.args.loss_names
-        self.current_task = [l.strip() for l in loss_names.split('+')]
-        print(f'Training Model with {self.current_task} tasks')
-    
-    
-    def cross_former(self, q, k, v):
-        x = self.cross_attn(
-                self.ln_pre_t(q),
-                self.ln_pre_i(k),
-                self.ln_pre_i(v),
-                need_weights=False)[0]
-        x = x.permute(1, 0, 2)  # NLD -> LND
-        x = self.cross_modal_transformer(x)
-        x = x.permute(1, 0, 2)  # LND -> NLD
-
-        x = self.ln_post(x)
-        return x
-
-    def _encode_image_tokens_single(self, image):
-        return self.base_model.encode_image(image)
-
-    def _encode_image_tokens(self, image):
-        if image.dim() == 4:
-            return self._encode_image_tokens_single(image)
-
-        elif image.dim() == 5:
-            b, t, c, h, w = image.shape
-            image = image.reshape(b * t, c, h, w)
-
-            x = self._encode_image_tokens_single(image)   # [B*T, L, D]
-            _, l, d = x.shape
-            x = x.reshape(b, t, l, d)                     # [B, T, L, D]
-            x = x.mean(dim=1)                             # [B, L, D]
-            return x
-
-        else:
-            raise ValueError(f"Unexpected image shape: {image.shape}")
-
-    def encode_image(self, image):
-        if image.dim() == 4:
-            x = self._encode_image_tokens(image)
-            return x[:, 0, :].float()
-
-        elif image.dim() == 5:
-            x = self._encode_image_tokens(image)
-            x = x[:, 0, :].float()                        # [B, D]
-            return x
-
-        else:
-            raise ValueError(f"Unexpected image shape: {image.shape}")
-
-    def encode_text(self, text):
-        x = self.base_model.encode_text(text)
-        return x[torch.arange(x.shape[0]), text.argmax(dim=-1)].float()
+    def encode_text(self, caption_ids: torch.Tensor) -> torch.Tensor:
+        token_features = self.base_model.encode_text(caption_ids)
+        batch_indices = torch.arange(
+            token_features.shape[0], device=token_features.device
+        )
+        end_positions = caption_ids.argmax(dim=-1)
+        return token_features[batch_indices, end_positions].float()
 
     def forward(self, batch):
-        ret = dict()
+        required = {"images", "caption_ids", "pids", "modalities"}
+        missing = required - set(batch)
+        if missing:
+            raise KeyError(f"Training batch is missing fields: {sorted(missing)}")
+        batch_size = batch["images"].shape[0]
+        if any(batch[key].shape[0] != batch_size for key in required - {"images"}):
+            raise ValueError("Training batch fields have inconsistent batch sizes")
+        if torch.any((batch["modalities"] != 0) & (batch["modalities"] != 1)):
+            raise ValueError("Training batch contains an unsupported modality")
+        image_features = self.encode_image(batch["images"])
+        text_features = self.encode_text(batch["caption_ids"])
+        outputs = {"temperature": 1.0 / self.logit_scale}
 
-        images = batch['images']
-        caption_ids = batch['caption_ids']
-        
-        i_feats = self.encode_image(images)
-        # i_feats = image_feats.float() # for CLIP ResNet visual model
-        t_feats = self.encode_text(caption_ids)
+        if "sdm" in self.current_task:
+            outputs["sdm_loss"] = objectives.compute_sdm(
+                image_features,
+                text_features,
+                batch["pids"],
+                self.logit_scale,
+            )
 
-        logit_scale = self.logit_scale
-        ret.update({'temperature': 1 / logit_scale})
-
-        if 'itc' in self.current_task:
-            ret.update({'itc_loss':objectives.compute_itc(i_feats, t_feats, logit_scale)})
-        
-        if 'sdm' in self.current_task:
-            ret.update({'sdm_loss':objectives.compute_sdm(i_feats, t_feats, batch['pids'], logit_scale)})
-
-        if 'cmpm' in self.current_task:
-            ret.update({'cmpm_loss':objectives.compute_cmpm(i_feats, t_feats, batch['pids'])})
-        
-        if 'id' in self.current_task:
+        if "id" in self.current_task:
             classifier_dtype = self.classifier.weight.dtype
-            image_logits = self.classifier(i_feats.to(classifier_dtype)).float()
-            text_logits = self.classifier(t_feats.to(classifier_dtype)).float()
-            ret.update({'id_loss':objectives.compute_id(image_logits, text_logits, batch['pids'])*self.args.id_loss_weight})
+            image_logits = self.classifier(
+                image_features.to(classifier_dtype)
+            ).float()
+            text_logits = self.classifier(
+                text_features.to(classifier_dtype)
+            ).float()
+            outputs["id_loss"] = (
+                objectives.compute_id(
+                    image_logits,
+                    text_logits,
+                    batch["pids"],
+                )
+                * self.args.id_loss_weight
+            )
+            outputs["img_acc"] = (
+                image_logits.argmax(dim=1) == batch["pids"]
+            ).float().mean()
+            outputs["txt_acc"] = (
+                text_logits.argmax(dim=1) == batch["pids"]
+            ).float().mean()
 
-            image_pred = torch.argmax(image_logits, dim=1)
-            text_pred = torch.argmax(text_logits, dim=1)
-
-            image_precision = (image_pred == batch['pids']).float().mean()
-            text_precision = (text_pred == batch['pids']).float().mean()
-            ret.update({'img_acc': image_precision})
-            ret.update({'txt_acc': text_precision})
-        
-        if 'mlm' in self.current_task:
-            image_feats = self._encode_image_tokens(images)
-            mlm_ids = batch['mlm_ids']
-            mlm_feats = self.base_model.encode_text(mlm_ids)
-
-            x = self.cross_former(mlm_feats, image_feats, image_feats)
-
-            x = self.mlm_head(x)  # [batch_size, text_len, num_colors]
-
-            scores = x.float().reshape(-1, self.args.vocab_size)
-            mlm_labels = batch['mlm_labels'].reshape(-1)
-            ret.update({'mlm_loss': objectives.compute_mlm(scores, mlm_labels)*self.args.mlm_loss_weight})
-
-            pred = scores.max(1)[1]
-            mlm_label_idx = torch.nonzero(mlm_labels)
-            acc = (pred[mlm_label_idx] == mlm_labels[mlm_label_idx]).float().mean()
-            ret.update({'mlm_acc': acc})
-
-        return ret
+        return outputs
 
 
-def build_model(args, num_classes=11003):
+def build_model(args, num_classes: int):
     model = IRRA(args, num_classes)
-    # covert model to fp16
     convert_weights(model)
     return model
